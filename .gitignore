@@ -1,4 +1,5 @@
-build/
+.cache/
+chip8
 
 # Prerequisites
 *.d

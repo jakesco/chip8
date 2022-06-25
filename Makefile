@@ -1,13 +1,14 @@
-wasm:
-	mkdir -p build
-	emcc src/*.c -o build/index.html -s USE_SDL=2
+native: src/main.c
+	clang -Wall src/*.c -o chip8 -lSDL2
 
-native:
-	mkdir -p build
-	clang src/*.c -o build/chip8 -lSDL2
+run:
+	./chip8
+
+wasm:
+	emcc src/*.c -o docs/chip8.js -s USE_SDL=2
 
 serve:
-	python -m http.server --directory build/
+	python -m http.server --directory docs/
 
 clean:
-	rm -rf build
+	rm chip8
