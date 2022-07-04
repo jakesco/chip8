@@ -1,21 +1,9 @@
 #include "chip.h"
 
-/*
- *  Chip-8 Emulator ram space
- *  0x000 -> Null
- *  0x001 -> DT
- *  0x002 -> ST
- *  0x003 - 0x004 -> I
- *  0x005 - 0x006 -> PC
- *  0x010 - 0x01F -> GP registers (V0 - VF)
- *  0x050 - 0x1FF -> Reserved for Fonts
- *  0x200 - 0xFFF -> Program Space
- */
-
 const address_t DT   = 0x001;
 const address_t ST   = 0x002;
-const address_t I    = 0x003;
-const address_t PC   = 0x005;
+const address_t I    = 0x003; // 16-bit
+const address_t PC   = 0x005; // 16-bit
 const address_t GP   = 0x010;
 const address_t FNT  = 0x050;
 const address_t PROG = 0x200;
@@ -39,33 +27,163 @@ const uint8_t DEFAULT_FONTS[80] = {
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
 };
 
-chip_t *create_chip(void) {
-    chip_t *chip_ptr = calloc(1, sizeof(chip_t));
-    check_mem(chip_ptr);
+SDL_Window *window = NULL;
+SDL_Renderer *renderer = NULL;
+uint8_t *rom = NULL;
+
+uint64_t counter = 0;
+
+bool running = false;
+uint8_t key_pressed = 0xFF; // Valid values 0x00 - 0x0F, 0xFF indicates no key pressed
+uint8_t ram[4096] = { 0 }; // 0x000 - 0xFFF
+uint8_t screen[BUFFER_LEN] = { 0 }; // 0x000 - 0x800
+                            
+uint8_t sp = 0; // stack pointer
+address_t stack[255] = { 0 }; // address stack
+
+uint64_t last_frame_time;
+
+void _put_16(uint8_t *array, address_t address, uint16_t value) {
+    /* Put a 16-bit value into ram starting at address */
+    array[address] = value >> 8;
+    array[address + 1] = value;
+}
+
+uint16_t _pull_16(uint8_t *array, address_t address) {
+    /* Pull a 16-bit value out of ram starting at address */
+    return (array[address] << 8) + array[address + 1];
+}
+
+void _stack_push(address_t address) {
+    if (sp == 255) {
+        log_err("Stack overflow.\n");
+    }
+    stack[sp++] = address;
+}
+
+address_t _stack_pop(void) {
+    if (sp == 0) {
+        log_err("Stack pointer popped when SP is 0.\n");
+        return 0x000;
+    }
+    return stack[--sp];
+}
+
+bool setup(void) {
+    check(SDL_Init(SDL_INIT_VIDEO) == 0, "Failed to initialize SDL.\n");
+
+    int rc = SDL_CreateWindowAndRenderer(
+            WINDOW_WIDTH,
+            WINDOW_HEIGHT,
+            SDL_WINDOW_BORDERLESS,
+            &window,
+            &renderer
+    );
+    check(rc == 0, "Failed to initialize window and renderer.\n");
 
     // Load default fonts
     size_t arr_length = sizeof DEFAULT_FONTS / sizeof DEFAULT_FONTS[0];
     for(int i = 0; i < arr_length; i++) {
-        chip_ptr->ram[FNT + i] = DEFAULT_FONTS[i];
+        ram[FNT + i] = DEFAULT_FONTS[i];
     }
 
-    return chip_ptr;
+    return true;
 
 error:
-    exit(1);
+    return false;
 }
 
-void destroy_chip(chip_t *chip_ptr) {
-    free(chip_ptr);
+void process_input(void) {
+    SDL_Event event;
+    SDL_PollEvent(&event);
+
+    switch (event.type) {
+        case SDL_QUIT:
+            running = false;
+            break;
+        case SDL_KEYDOWN:
+            switch (event.key.keysym.sym) {
+                case SDLK_ESCAPE: 
+                case SDLK_q: 
+                    running = false;
+                    break;
+            }
+            break;
+        case SDL_KEYUP:
+            break;
+    }
 }
 
-/* =============================================================================================================
- * =====================                      Instructions                                ======================
- * =============================================================================================================
- * The original implementation of the Chip-8 language includes 36 different instructions, including math,
- * graphics, and flow control functions. All instructions are 2 bytes long and are stored most-significant-byte
- * first. In memory, the first byte of each instruction should be located at an even addresses. If a program
- * includes sprite data, it should be padded so any instructions following it will be properly situated in RAM.
+void update(void) {
+    last_frame_time = SDL_GetTicks64();
+
+    size_t pos = counter % BUFFER_LEN;
+    screen[pos] = ~screen[pos];
+    counter++;
+}
+
+void render(void) { 
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderClear(renderer);
+
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    SDL_Rect pixel = { 0, 0, SCALE_FACTOR, SCALE_FACTOR };
+    uint8_t *screen_buffer = screen;
+    for (int i = 0; i < BUFFER_LEN; i++) {
+        if (screen_buffer[i] == 0) {
+            continue;
+        }
+        pixel.x = (int)(i % BUFFER_WIDTH) * SCALE_FACTOR;
+        pixel.y = (int)(i / BUFFER_WIDTH) * SCALE_FACTOR;
+        SDL_RenderFillRect(renderer, &pixel);
+    }
+    SDL_RenderPresent(renderer);
+}
+
+void destroy_window() {
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+}
+
+uint64_t time_to_next_tick(void) {
+    uint64_t time_to_wait = TARGET_FRAME_TIME - (SDL_GetTicks64() - last_frame_time);
+    return (time_to_wait > 0 && time_to_wait <= TARGET_FRAME_TIME) ? time_to_wait : 0;
+}
+
+void tick(void) {
+    process_input();
+    update();
+    render();
+}
+
+int main(int argc, char *argv[]) {
+    running = setup();
+
+#ifdef __EMSCRIPTEN__
+    emscripten_set_main_loop(tick, CLOCK, 1);
+#else
+    while (running) { 
+        tick(); 
+        SDL_Delay(time_to_next_tick());
+    }
+#endif
+    log_info("Exiting game loop.\n");
+
+    destroy_window();
+
+    return EXIT_SUCCESS;
+}
+
+/* ============================================================================
+ * ===================          Instructions             ======================
+ * ============================================================================
+ * The original implementation of the Chip-8 language includes 36 different 
+ * instructions, including math,graphics, and flow control functions. All 
+ * instructions are 2 bytes long and are stored most-significant-byte first. 
+ * In memory, the first byte of each instruction should be located at an even 
+ * addresses. If a program includes sprite data, it should be padded so any 
+ * instructions following it will be properly situated in RAM.
  * In these listings, the following variables are used:
  * nnn or addr - A 12-bit value, the lowest 12 bits of the instruction
  * n or nibble - A 4-bit value, the lowest 4 bits of the instruction
@@ -83,44 +201,43 @@ void destroy_chip(chip_t *chip_ptr) {
 /*     DXYN (display/draw) */
 
 
-void ins_sys(chip_t *chip, address_t address) {
+void ins_sys(address_t address) {
     /*
     0nnn - SYS addr (Unimplemented)
     Jump to a machine code routine at nnn.
     */
 }
 
-void ins_clear(chip_t *chip) {
+void ins_clear(void) {
     /*
     00E0 - CLS
     Clear the display.
     */
-    uint8_t *vram = chip->screen;
-    for(int i = 0; i < SCREEN_LEN; i++) {
+    uint8_t *vram = screen;
+    for(int i = 0; i < BUFFER_LEN; i++) {
         vram[i] = 0;
     }
     debug("Cleared Screen.");
 }
 
-void ins_return(chip_t *chip) {
+void ins_return(void) {
     /*
     00EE - RET
     Return from a subroutine.
     */
-    address_t address = chip->stack[chip->sp--];
-    chip->ram[PC] = address;
+    address_t address = _stack_pop();
+    ram[PC] = address;
     debug("Return from subroutine. Set PC to @0x%x.\n", address);
 }
 
-void ins_jump(chip_t *chip, address_t address) {
+void ins_jump(address_t address) {
     /*
     1nnn - JP addr
     Jump to location nnn.
     */
-    chip->ram[PC] = address;
+    ram[PC] = address;
     debug("Jump to: 0x%03x.", address);
 }
-
 
 /*
 def call(chip: Chip8, address: Address):
@@ -158,25 +275,27 @@ def skip_eqr(chip: Chip8, x: Register, y: Register):
     if chip.get_register(x) == chip.get_register(y):
         chip.set_pc(chip.pc + 2)
 
+*/
 
-def set_(chip: Chip8, register: Register, byte: int):
-    """
+void ins_set(uint8_t x, uint8_t byte) {
+    /* 
     6xkk - LD Vx, byte
     Set Vx = kk.
-    """
-    logger.info("Set 'Register' V%d to 0x%02x.", register, byte)
-    chip.set_register(register, byte)
+    */ 
+    ram[GP + x] = byte;
+    debug("Set 'Register' V%X to 0x%x.", x, byte);
+}
 
-
-def add(chip: Chip8, register: Register, byte: int):
-    """
+void ins_add(uint8_t x, uint8_t byte) {
+    /* 
     7xkk - ADD Vx, byte
     Set Vx = Vx + kk.
-    """
-    logger.info("Add 0x%02x to register V%d.", byte, register)
-    chip.set_register(register, chip.get_register(register) + byte)
+    */ 
+    ram[GP + x] += byte;
+    debug("Add 0x%x to register V%X.", byte, x);
+}
 
-
+/*
 def set_r(chip: Chip8, x: Register, y: Register):
     """
     8xy0 - LD Vx, Vy
@@ -299,17 +418,18 @@ def skip_ner(chip: Chip8, x: Register, y: Register):
     """
     if chip.get_register(x) != chip.get_register(y):
         chip.set_pc(chip.pc + 2)
+*/
 
-
-def set_index(chip: Chip8, address: Address):
-    """
+void ins_set_i(address_t address) {
+    /*
     Annn - LD I, addr
     Set I = nnn.
-    """
-    logger.info("Set register I to 0x%03x.", address)
-    chip.set_i(address)
+    */
+    _put_16(ram, I, address);
+    debug("Set register I to 0x%x.", address);
+}
 
-
+/*
 def jump_with_offset(chip: Chip8, address: Address):
     """
     Bnnn - JP V0, addr
@@ -328,43 +448,23 @@ def random_(chip: Chip8, x: Register, byte: int):
     logger.info("Generating random integer.")
     val = random.randint(0x00, 0xFF) & byte
     chip.set_register(x, val)
+*/
 
-
-def display(chip: Chip8, x: Register, y: Register, sprite_size: int):
-    """
+void ins_display(uint8_t x, uint8_t y, size_t sprite_size) {
+    /*
     Dxyn - DRW Vx, Vy, nibble
     Display n-byte sprite starting at memory location I at (Vx, Vy), set VF = collision.
-    """
-    x_start = chip.get_register(x) % 64
-    y_start = chip.get_register(y) % 32
-    max_y = min(32 - y_start, sprite_size)
-    max_x = min(64 - x_start, 8)
-    sprite_idx = chip.i
+    */
+    uint8_t x_start = ram[GP + x] % 64;
+    uint8_t y_start = ram[GP + y] % 32;
+    int max_y = fmin(32 - y_start, sprite_size);
+    int max_x = fmin(64 - x_start, 8);
+    address_t sprite_idx = _pull_16(ram, I);
 
-    logger.info(
-        "Draw %d byte sprite at memory address 0x%03x starting at coordinate (%d, %d).",
-        sprite_size,
-        chip.i,
-        x_start,
-        y_start,
-    )
+    debug("Draw: (%d, %d) | %d %d | %d\n", x_start, y_start, max_x, max_y, sprite_idx);
+}
 
-    chip.clear_vf()
-    for offset in range(max_y):
-        bits = unpack_8bit_hex(chip.ram[sprite_idx + offset])
-        start_addr = (64 * (y_start + offset)) + x_start
-        for idx in range(max_x):
-            addr = start_addr + idx
-            new_bit = bits[idx]
-            old_bit = chip.vram[addr]
-            set_bit = new_bit ^ old_bit
-            logger.debug("Setting VRAM @0x%03x to 0x%02x.", addr, set_bit)
-            chip.vram[addr] = set_bit
-            if (not chip.vf) and (new_bit & old_bit):
-                logger.debug("Collision detected, setting VF.")
-                chip.set_vf()
-
-
+/*
 def skip_if_pressed(chip: Chip8, x: Register):
     """
     Ex9E - SKP Vx
